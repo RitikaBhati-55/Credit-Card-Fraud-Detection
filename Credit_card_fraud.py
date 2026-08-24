@@ -10,7 +10,9 @@ from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.svm import SVC
 from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score, roc_curve
-from sklearn.metrics import precision_recall_curve, accuracy_score, f1_score
+from sklearn.metrics import precision_recall_curve, accuracy_score, f1_score, recall_score
+from imblearn.over_sampling import SMOTE
+import os
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -83,9 +85,24 @@ st.markdown("---")
 
 # Sidebar
 st.sidebar.header("⚙️ Configuration")
-n_samples = st.sidebar.slider("Number of Transactions", 1000, 50000, 10000, 1000)
+data_source = st.sidebar.radio(
+    "Data Source",
+    ["Synthetic Data", "Real Dataset (creditcard.csv)"],
+    help="Real Kaggle dataset has only 0.17% fraud — severe class imbalance"
+)
+if data_source == "Synthetic Data":
+    n_samples = st.sidebar.slider("Number of Transactions", 1000, 50000, 10000, 1000)
+    fraud_rate = st.sidebar.slider("Fraud Rate (%)", 5, 30, 15, 5) / 100
+else:
+    sample_size = st.sidebar.slider(
+        "Sample Size (rows)", 10000, 284807, 50000, 10000,
+        help="Full dataset is 284k rows; smaller samples train faster"
+    )
 test_size = st.sidebar.slider("Test Size (%)", 10, 40, 30, 5) / 100
-fraud_rate = st.sidebar.slider("Fraud Rate (%)", 5, 30, 15, 5) / 100
+use_smote = st.sidebar.checkbox(
+    "Apply SMOTE (balance classes)",
+    help="Oversamples the minority (fraud) class on the training set only"
+)
 
 # Generate data function
 @st.cache_data
@@ -168,10 +185,27 @@ def generate_dataset(n_samples, fraud_rate):
     
     return df
 
+@st.cache_data
+def load_real_data(path):
+    df = pd.read_csv(path)
+    df = df.rename(columns={'Class': 'is_fraud'})
+    df['amount'] = df['Amount'].astype(float)
+    df['time_hour'] = (df['Time'] // 3600) % 24
+    return df
+
 # Generate data button
-if st.sidebar.button("🔄 Generate Data", type="primary"):
+if st.sidebar.button("🔄 Load Data", type="primary"):
     st.session_state['data_generated'] = True
-    st.session_state['df'] = generate_dataset(n_samples, fraud_rate)
+    if data_source == "Synthetic Data":
+        st.session_state['df'] = generate_dataset(n_samples, fraud_rate)
+    else:
+        try:
+            st.session_state['df'] = load_real_data("creditcard.csv")
+        except FileNotFoundError:
+            st.sidebar.error("creditcard.csv not found in the project folder!")
+            st.session_state['data_generated'] = False
+    for key in ['results', 'X_test', 'y_test', 'scaler', 'smote_info', 'feature_cols', 'profiles']:
+        st.session_state.pop(key, None)
 
 if 'data_generated' in st.session_state and st.session_state['data_generated']:
     df = st.session_state['df']
@@ -235,19 +269,27 @@ if 'data_generated' in st.session_state and st.session_state['data_generated']:
                             barmode='overlay')
             st.plotly_chart(fig, use_container_width=True)
             
-            # Distance scatter
-            fig = px.scatter(df, x='distance_from_home', y='amount',
-                           color='is_fraud', 
-                           labels={'distance_from_home': 'Distance from Home (km)',
-                                  'amount': 'Amount ($)'},
-                           title='Distance vs Amount',
-                           color_discrete_map={0: '#2ecc71', 1: '#e74c3c'})
-            st.plotly_chart(fig, use_container_width=True)
+            # Distance scatter (synthetic features only)
+            if 'distance_from_home' in df.columns:
+                fig = px.scatter(df, x='distance_from_home', y='amount',
+                               color='is_fraud', 
+                               labels={'distance_from_home': 'Distance from Home (km)',
+                                      'amount': 'Amount ($)'},
+                               title='Distance vs Amount',
+                               color_discrete_map={0: '#2ecc71', 1: '#e74c3c'})
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                fig = px.scatter(df.sample(min(5000, len(df))), x='V17', y='amount',
+                               color='is_fraud',
+                               labels={'V17': 'V17 (PCA feature)', 'amount': 'Amount ($)'},
+                               title='V17 vs Amount (V17: strongest fraud indicator)',
+                               color_discrete_map={0: '#2ecc71', 1: '#e74c3c'})
+                st.plotly_chart(fig, use_container_width=True)
         
-        # Correlation heatmap
+        # Correlation heatmap — top features correlated with fraud
         st.subheader("Feature Correlation Matrix")
-        top_features = ['amount', 'distance_from_home', 'ratio_to_median',
-                       'velocity_1h', 'velocity_24h', 'unusual_time', 'is_fraud']
+        corr_with_target = df.corr(numeric_only=True)['is_fraud'].abs().sort_values(ascending=False)
+        top_features = list(corr_with_target.head(8).index)
         corr = df[top_features].corr()
         fig = px.imshow(corr, text_auto='.2f', aspect='auto',
                        color_continuous_scale='RdBu_r',
@@ -271,19 +313,34 @@ if 'data_generated' in st.session_state and st.session_state['data_generated']:
                 X_train_scaled = scaler.fit_transform(X_train)
                 X_test_scaled = scaler.transform(X_test)
                 
-                # Train models
+                # Class distribution before balancing
+                before_counts = y_train.value_counts().to_dict()
+                
+                # Apply SMOTE on training set only (never on test data!)
+                train_X, train_y = X_train_scaled, y_train
+                smote_info = None
+                if use_smote:
+                    smote = SMOTE(random_state=42)
+                    train_X, train_y = smote.fit_resample(X_train_scaled, y_train)
+                    smote_info = {
+                        'before': before_counts,
+                        'after': pd.Series(train_y).value_counts().to_dict()
+                    }
+                
+                # Train models (SVM skipped in real-dataset mode — too slow for 100k+ rows)
                 models = {
                     'Logistic Regression': LogisticRegression(max_iter=1000, random_state=42),
                     'Random Forest': RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42),
                     'Gradient Boosting': GradientBoostingClassifier(n_estimators=100, max_depth=5, random_state=42),
-                    'SVM': SVC(kernel='rbf', probability=True, random_state=42)
                 }
+                if data_source == "Synthetic Data":
+                    models['SVM'] = SVC(kernel='rbf', probability=True, random_state=42)
                 
                 results = {}
                 progress_bar = st.progress(0)
                 
                 for idx, (name, model) in enumerate(models.items()):
-                    model.fit(X_train_scaled, y_train)
+                    model.fit(train_X, train_y)
                     y_pred = model.predict(X_test_scaled)
                     y_pred_proba = model.predict_proba(X_test_scaled)[:, 1]
                     
@@ -293,6 +350,7 @@ if 'data_generated' in st.session_state and st.session_state['data_generated']:
                         'probabilities': y_pred_proba,
                         'accuracy': accuracy_score(y_test, y_pred),
                         'f1': f1_score(y_test, y_pred),
+                        'recall': recall_score(y_test, y_pred),
                         'roc_auc': roc_auc_score(y_test, y_pred_proba),
                         'confusion_matrix': confusion_matrix(y_test, y_pred)
                     }
@@ -302,7 +360,17 @@ if 'data_generated' in st.session_state and st.session_state['data_generated']:
                 st.session_state['X_test'] = X_test_scaled
                 st.session_state['y_test'] = y_test
                 st.session_state['scaler'] = scaler
-                st.success("✅ Models trained successfully!")
+                st.session_state['smote_info'] = smote_info
+                st.session_state['feature_cols'] = list(X.columns)
+                st.session_state['profiles'] = {
+                    'Normal': X_train[y_train == 0].mean(),
+                    'Fraud': X_train[y_train == 1].mean()
+                }
+                if smote_info:
+                    b, a = smote_info['before'], smote_info['after']
+                    st.success(f"✅ Models trained with SMOTE! Train set — Normal: {b.get(0,0):,}, Fraud: {b.get(1,0):,} → Balanced: {a.get(0.0, a.get(0,0)):,} each")
+                else:
+                    st.success("✅ Models trained successfully!")
     
     with tab3:
         if 'results' in st.session_state:
@@ -316,6 +384,10 @@ if 'data_generated' in st.session_state and st.session_state['data_generated']:
             accuracies = [results[m]['accuracy'] for m in model_names]
             f1_scores = [results[m]['f1'] for m in model_names]
             roc_aucs = [results[m]['roc_auc'] for m in model_names]
+            recalls = [results[m]['recall'] for m in model_names]
+            
+            if st.session_state.get('smote_info'):
+                st.info("⚖️ Trained with SMOTE — minority (fraud) class was oversampled in the training set")
             
             col1, col2 = st.columns(2)
             
@@ -326,6 +398,8 @@ if 'data_generated' in st.session_state and st.session_state['data_generated']:
                                     marker_color='#3498db'))
                 fig.add_trace(go.Bar(name='F1-Score', x=model_names, y=f1_scores,
                                     marker_color='#2ecc71'))
+                fig.add_trace(go.Bar(name='Recall (Fraud)', x=model_names, y=recalls,
+                                    marker_color='#9b59b6'))
                 fig.add_trace(go.Bar(name='ROC-AUC', x=model_names, y=roc_aucs,
                                     marker_color='#e74c3c'))
                 fig.update_layout(title='Model Performance Comparison',
@@ -394,35 +468,53 @@ if 'data_generated' in st.session_state and st.session_state['data_generated']:
         if 'results' in st.session_state:
             st.header("Test New Transaction")
             
-            col1, col2, col3 = st.columns(3)
-            
-            with col1:
-                amount = st.number_input("Amount ($)", 10.0, 10000.0, 100.0)
-                time_hour = st.slider("Hour", 0, 23, 12)
-                distance_home = st.number_input("Distance from Home (km)", 0.0, 1000.0, 10.0)
-                velocity_1h = st.number_input("Transactions in Last Hour", 0, 10, 1)
-            
-            with col2:
-                online = st.selectbox("Online Order", [0, 1], format_func=lambda x: "Yes" if x else "No")
-                chip = st.selectbox("Used Chip", [0, 1], format_func=lambda x: "Yes" if x else "No")
-                pin = st.selectbox("Used PIN", [0, 1], format_func=lambda x: "Yes" if x else "No")
-                international = st.selectbox("International", [0, 1], format_func=lambda x: "Yes" if x else "No")
-            
-            with col3:
-                day_of_week = st.slider("Day of Week", 0, 6, 3)
-                ratio = st.number_input("Ratio to Median", 0.1, 10.0, 1.0)
-                velocity_24h = st.number_input("Transactions in 24h", 0, 20, 3)
-                unusual_time = st.selectbox("Unusual Time", [0, 1], format_func=lambda x: "Yes" if x else "No")
-            
-            if st.button("🔍 Predict", type="primary"):
-                # Create transaction
-                transaction = np.array([[
+            if data_source == "Synthetic Data":
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    amount = st.number_input("Amount ($)", 10.0, 10000.0, 100.0)
+                    time_hour = st.slider("Hour", 0, 23, 12)
+                    distance_home = st.number_input("Distance from Home (km)", 0.0, 1000.0, 10.0)
+                    velocity_1h = st.number_input("Transactions in Last Hour", 0, 10, 1)
+                
+                with col2:
+                    online = st.selectbox("Online Order", [0, 1], format_func=lambda x: "Yes" if x else "No")
+                    chip = st.selectbox("Used Chip", [0, 1], format_func=lambda x: "Yes" if x else "No")
+                    pin = st.selectbox("Used PIN", [0, 1], format_func=lambda x: "Yes" if x else "No")
+                    international = st.selectbox("International", [0, 1], format_func=lambda x: "Yes" if x else "No")
+                
+                with col3:
+                    day_of_week = st.slider("Day of Week", 0, 6, 3)
+                    ratio = st.number_input("Ratio to Median", 0.1, 10.0, 1.0)
+                    velocity_24h = st.number_input("Transactions in 24h", 0, 20, 3)
+                    unusual_time = st.selectbox("Unusual Time", [0, 1], format_func=lambda x: "Yes" if x else "No")
+                
+                transaction_raw = [[
                     amount, time_hour, day_of_week, distance_home,
                     distance_home * 0.5, ratio, 0, chip, pin, online,
                     velocity_1h, velocity_24h, amount, amount * 0.3, 5,
                     1, international, 0, unusual_time, 1 if day_of_week >= 5 else 0
-                ]])
-                
+                ]]
+                transaction = pd.DataFrame(
+                    transaction_raw,
+                    columns=st.session_state['feature_cols']
+                )
+            else:
+                st.info("🧪 Real-dataset mode: features are PCA-anonymised (V1–V28), so pick a base profile and adjust the amount")
+                profile_name = st.radio(
+                    "Base Profile",
+                    ["Typical Normal", "Typical Fraud"],
+                    horizontal=True
+                )
+                amount = st.number_input("Amount ($)", 0.0, 30000.0, 100.0)
+                profiles = st.session_state['profiles']
+                row = profiles['Fraud' if profile_name == 'Typical Fraud' else 'Normal'].copy()
+                for col in ('amount', 'Amount'):
+                    if col in row.index:
+                        row[col] = amount
+                transaction = pd.DataFrame([row.values], columns=st.session_state['feature_cols'])
+            
+            if st.button("🔍 Predict", type="primary"):
                 scaler = st.session_state['scaler']
                 transaction_scaled = scaler.transform(transaction)
                 
